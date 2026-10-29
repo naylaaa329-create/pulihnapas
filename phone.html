@@ -1,0 +1,247 @@
+<!doctype html>
+<html lang="id">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>PulihNapas - HP</title>
+<script src="https://unpkg.com/mqtt@5/dist/mqtt.min.js"></script>
+<style>
+  :root { --bg:#0f172a; --card:#1e293b; --tx:#e2e8f0; --mut:#94a3b8; --ok:#4ade80; --warn:#fbbf24; --bad:#f87171; }
+  * { box-sizing:border-box; }
+  body { margin:0; font-family:system-ui,sans-serif; background:var(--bg); color:var(--tx); padding:16px; max-width:480px; margin-inline:auto; }
+  h1 { font-size:20px; margin:0 0 4px; }
+  .row { display:flex; gap:8px; align-items:center; flex-wrap:wrap; margin-bottom:12px; }
+  .badge { background:var(--card); border-radius:999px; padding:4px 12px; font-size:13px; color:var(--mut); }
+  .badge b { color:var(--tx); }
+  .phase { background:var(--card); border-radius:16px; padding:20px; text-align:center; margin-bottom:12px; }
+  .phase .name { font-size:32px; font-weight:700; letter-spacing:1px; text-transform:uppercase; }
+  .phase .hint { color:var(--mut); font-size:14px; margin-top:6px; min-height:40px; }
+  .grid { display:grid; grid-template-columns:repeat(3,1fr); gap:8px; margin-bottom:12px; }
+  .box { background:var(--card); border-radius:12px; padding:12px; text-align:center; }
+  .box .v { font-size:26px; font-weight:700; }
+  .box .l { font-size:12px; color:var(--mut); }
+  canvas { width:100%; height:90px; background:var(--card); border-radius:12px; margin-bottom:12px; }
+  button { width:100%; padding:16px; font-size:18px; font-weight:700; border:0; border-radius:12px; background:var(--ok); color:#052e16; }
+  button:disabled { background:#334155; color:var(--mut); }
+  #warn { color:var(--warn); font-size:14px; min-height:20px; margin-top:10px; }
+  small { color:var(--mut); display:block; margin-top:14px; line-height:1.5; }
+</style>
+</head>
+<body>
+<h1>PulihNapas</h1>
+<div class="row">
+  <span class="badge">Perangkat: <b id="idTxt">-</b></span>
+  <span class="badge">MQTT: <b id="mqttTxt">menghubungkan...</b></span>
+</div>
+
+<div class="phase">
+  <div class="name" id="phaseName">idle</div>
+  <div class="hint" id="phaseHint">Tekan "Mulai sensor", lalu tunggu perintah dari dashboard.</div>
+</div>
+
+<div class="grid">
+  <div class="box"><div class="v" id="bpmV">-</div><div class="l">napas/menit</div></div>
+  <div class="box"><div class="v" id="repsV">0</div><div class="l">repetisi</div></div>
+  <div class="box"><div class="v" id="hzV">0</div><div class="l">sampel/detik</div></div>
+</div>
+
+<canvas id="wave" width="440" height="90"></canvas>
+
+<button id="startBtn">Mulai sensor</button>
+<div id="warn"></div>
+
+<small>
+  Alur: Baseline (rebahan, HP di perut) &rarr; Aktivitas (HP di saku/dipegang, lompat atau squat) &rarr; Pemulihan (rebahan, HP di perut, diam).<br>
+  Biarkan layar tetap menyala. Alat ini bukan alat medis; berhenti jika pusing.
+</small>
+
+<script>
+/* ====== KONFIGURASI ====== */
+const params = new URLSearchParams(location.search);
+const ROOM = params.get("room") || "pn-kelD-x7q3";   // GANTI: samakan dengan dashboard.html
+const ID   = params.get("id")   || "hp1";             // hp1 atau hp2
+const BROKERS = params.get("broker") ? [params.get("broker")] :
+  ["wss://broker.hivemq.com:8884/mqtt", "wss://broker.emqx.io:8084/mqtt"];
+const REP_THRESH = parseFloat(params.get("th")) || 2.5;   // m/s^2, ambang repetisi
+const PEAK_K     = parseFloat(params.get("k"))  || 0.5;   // ambang puncak napas = K * sd
+const FS = 10;               // laju sampel setelah diratakan (Hz)
+const WIN = 30 * FS;         // jendela 30 detik
+const MIN_SAMPLES = 15 * FS; // minimal data sebelum menghitung napas
+const REPORT_EVERY = 5;      // detik antar laporan napas
+
+const $ = id => document.getElementById(id);
+$("idTxt").textContent = ID;
+
+/* ====== MQTT ====== */
+let client = null, brokerIdx = 0, connected = false;
+
+function connectMQTT() {
+  const url = BROKERS[brokerIdx % BROKERS.length];
+  $("mqttTxt").textContent = "menghubungkan...";
+  client = mqtt.connect(url, { clientId: `pn-${ID}-${Math.random().toString(16).slice(2, 8)}`, reconnectPeriod: 3000, connectTimeout: 6000 });
+  const failTimer = setTimeout(() => {          // pindah ke broker cadangan bila gagal
+    if (!connected) { client.end(true); brokerIdx++; connectMQTT(); }
+  }, 9000);
+  client.on("connect", () => {
+    clearTimeout(failTimer);
+    connected = true;
+    $("mqttTxt").textContent = "terhubung";
+    client.subscribe(`${ROOM}/cmd`);
+  });
+  client.on("close", () => { connected = false; $("mqttTxt").textContent = "terputus"; });
+  client.on("message", (_, m) => {
+    let msg; try { msg = JSON.parse(m.toString()); } catch { return; }
+    if (msg && msg.cmd) setPhase(msg.cmd, msg.t);
+  });
+}
+function pub(sub, obj) {
+  if (client && connected) client.publish(`${ROOM}/dev/${ID}/${sub}`, JSON.stringify(obj));
+}
+
+/* ====== FASE ====== */
+let phase = "idle";
+const HINTS = {
+  idle: "Menunggu perintah dari dashboard.",
+  baseline: "Rebahan telentang, HP di perut, tangan lepas, diam dan jangan bicara.",
+  activity: "Pegang HP atau taruh di saku, lalu lompat di tempat atau squat.",
+  recovery: "Segera rebahan telentang, HP di perut, diam. Napas dipantau.",
+};
+function setPhase(cmd, cmdT) {
+  if (cmd === "stop") cmd = "idle";
+  if (!HINTS[cmd]) return;
+  phase = cmd;
+  resetBuffers();
+  if (cmd === "activity") { reps = 0; lp = 9.8; s1 = s2 = 0; lastRep = 0; }
+  $("phaseName").textContent = phase;
+  $("phaseHint").textContent = HINTS[phase];
+  $("repsV").textContent = reps;
+  pub("ack", { cmd, t: cmdT, from: ID });      // konfirmasi: dipakai dashboard untuk hitung latensi
+}
+
+/* ====== PEMROSESAN 1: HITUNG REPETISI ====== */
+let lp = 9.8, s1 = 0, s2 = 0, reps = 0, lastRep = 0;
+function countRep(t, ax, ay, az) {
+  const mag = Math.hypot(ax, ay, az);
+  lp = 0.95 * lp + 0.05 * mag;                  // perkiraan gravitasi
+  const sm = 0.6 * s1 + 0.4 * (mag - lp);       // gerakan saja, dihaluskan
+  if (s1 > s2 && s1 > sm && s1 > REP_THRESH && t - lastRep > 0.4) { reps++; lastRep = t; }
+  s2 = s1; s1 = sm;
+}
+
+/* ====== PEMROSESAN 2: ESTIMASI NAPAS PER MENIT ====== */
+function movAvg(x, half) {
+  return x.map((_, i) => {
+    let s = 0, c = 0;
+    for (let j = Math.max(0, i - half); j <= Math.min(x.length - 1, i + half); j++) { s += x[j]; c++; }
+    return s / c;
+  });
+}
+function estimateBPM(x, fs = FS) {
+  const n = x.length;
+  const trend = movAvg(x, 3 * fs);                          // buang tren pelan (jendela ~6 detik)
+  const y = movAvg(x.map((v, i) => v - trend[i]), 2);       // haluskan
+  const sd = Math.sqrt(y.reduce((a, b) => a + b * b, 0) / n);
+  const peaks = [];
+  for (let i = 1; i < n - 1; i++) {
+    if (y[i] > y[i - 1] && y[i] >= y[i + 1] && y[i] > PEAK_K * sd &&
+        (!peaks.length || i - peaks[peaks.length - 1] > 1.2 * fs)) peaks.push(i);
+  }
+  if (peaks.length < 3) return { bpm: null, amp: sd, cv: 9 };
+  const iv = []; for (let i = 1; i < peaks.length; i++) iv.push(peaks[i] - peaks[i - 1]);
+  const mean = iv.reduce((a, b) => a + b, 0) / iv.length;
+  const cv = Math.sqrt(iv.reduce((a, b) => a + (b - mean) ** 2, 0) / iv.length) / mean; // makin kecil = makin teratur
+  return { bpm: 60 * (peaks.length - 1) / ((peaks[peaks.length - 1] - peaks[0]) / fs), amp: sd, cv };
+}
+
+/* ====== PENGUMPULAN SINYAL (diratakan ke 10 titik/detik) ====== */
+let A = [], G = [[], [], []], ang = [0, 0, 0];
+let curBin = null, sumMag = 0, cnt = 0, lastT = 0;
+function resetBuffers() { A = []; G = [[], [], []]; ang = [0, 0, 0]; curBin = null; sumMag = 0; cnt = 0; }
+
+function onSample(t, ax, ay, az, ra, rb, rc) {
+  if (phase === "activity") countRep(t, ax, ay, az);
+  const dt = lastT ? Math.min(t - lastT, 0.1) : 0; lastT = t;
+  ang[0] += ra * dt; ang[1] += rb * dt; ang[2] += rc * dt;   // integrasi giroskop jadi sudut
+  const bin = Math.floor(t * FS);
+  if (curBin === null) curBin = bin;
+  if (bin !== curBin) {
+    if (cnt) {
+      A.push(sumMag / cnt); for (let k = 0; k < 3; k++) G[k].push(ang[k]);
+      if (A.length > WIN) { A.shift(); for (let k = 0; k < 3; k++) G[k].shift(); }
+    }
+    sumMag = 0; cnt = 0; curBin = bin;
+  }
+  sumMag += Math.hypot(ax, ay, az); cnt++;
+}
+
+function computeBreath() {
+  if (A.length < MIN_SAMPLES) return { bpm: null, amp: 0, a: null, g: null };
+  const rA = estimateBPM(A);
+  let rG = null;                                  // pilih sumbu giroskop dengan variasi terbesar
+  for (let k = 0; k < 3; k++) { const r = estimateBPM(G[k]); if (!rG || r.amp > rG.amp) rG = r; }
+  let bpm;
+  if (rA.bpm && rG.bpm) {
+    if (Math.abs(rA.bpm - rG.bpm) <= 3) bpm = (rA.bpm + rG.bpm) / 2;      // keduanya sepakat: rata-rata
+    else bpm = rA.cv <= rG.cv ? rA.bpm : rG.bpm;                           // beda: ambil yang lebih teratur
+  } else bpm = rA.bpm ?? rG.bpm;
+  return { bpm, amp: Math.max(rA.amp, 0), a: rA.bpm, g: rG.bpm };
+}
+
+/* ====== SENSOR ====== */
+let started = false, evCount = 0, evTotal = 0;
+async function startSensors() {
+  if (started) return;
+  if (typeof DeviceMotionEvent !== "undefined" && typeof DeviceMotionEvent.requestPermission === "function") {
+    try {
+      const r = await DeviceMotionEvent.requestPermission();   // khusus iPhone
+      if (r !== "granted") { $("warn").textContent = "Izin sensor ditolak."; return; }
+    } catch (e) { $("warn").textContent = "Gagal meminta izin sensor: " + e; return; }
+  }
+  try { await navigator.wakeLock.request("screen"); } catch {}  // layar tetap menyala
+  addEventListener("devicemotion", e => {
+    const a = e.accelerationIncludingGravity, g = e.rotationRate;
+    if (!a || a.x == null) return;
+    evCount++; evTotal++;
+    onSample(performance.now() / 1000, a.x, a.y, a.z, g?.alpha || 0, g?.beta || 0, g?.gamma || 0);
+  });
+  started = true;
+  $("startBtn").disabled = true; $("startBtn").textContent = "Sensor aktif";
+  setTimeout(() => { if (evTotal === 0) $("warn").textContent = "Sensor tidak terbaca. Pakai HP asli dan buka lewat HTTPS (GitHub Pages)."; }, 3000);
+}
+$("startBtn").addEventListener("click", startSensors);
+
+/* ====== TICK 1 DETIK: UI, LAPORAN, GRAFIK ====== */
+let tick = 0;
+function draw() {
+  const c = $("wave"), g = c.getContext("2d"), w = c.width, h = c.height;
+  g.clearRect(0, 0, w, h);
+  if (A.length < 5) return;
+  const m = A.reduce((a, b) => a + b, 0) / A.length;
+  const d = A.map(v => v - m);
+  const mx = Math.max(0.02, ...d.map(Math.abs));
+  g.beginPath();
+  d.forEach((v, i) => { const x = i / (WIN - 1) * w, y = h / 2 - v / mx * (h / 2 - 6); i ? g.lineTo(x, y) : g.moveTo(x, y); });
+  g.strokeStyle = "#4ade80"; g.lineWidth = 2; g.stroke();
+}
+setInterval(() => {
+  tick++;
+  $("hzV").textContent = evCount; evCount = 0;
+  $("repsV").textContent = reps;
+  draw();
+  if (!started) return;
+  if (phase === "activity") pub("reps", { reps, t: Date.now() });
+  if (tick % REPORT_EVERY === 0) {
+    if (phase === "baseline" || phase === "recovery") {
+      const r = computeBreath();
+      $("bpmV").textContent = r.bpm ? r.bpm.toFixed(1) : "-";
+      pub("resp", { bpm: r.bpm ? +r.bpm.toFixed(1) : null, amp: +r.amp.toFixed(3), phase, a: r.a ? +r.a.toFixed(1) : null, g: r.g ? +r.g.toFixed(1) : null, t: Date.now() });
+    } else {
+      pub("resp", { bpm: null, amp: 0, phase, t: Date.now() });   // detak status supaya dashboard tahu HP aktif
+    }
+  }
+}, 1000);
+
+connectMQTT();
+</script>
+</body>
+</html>

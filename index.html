@@ -1,0 +1,35 @@
+<!doctype html>
+<html lang="id">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>PulihNapas</title>
+<style>
+  body { font-family:system-ui,sans-serif; background:#0f172a; color:#e2e8f0; max-width:560px; margin:40px auto; padding:0 16px; }
+  a { display:block; background:#1e293b; color:#4ade80; padding:16px; border-radius:12px; margin:10px 0; text-decoration:none; font-weight:600; }
+  p, label { color:#94a3b8; font-size:14px; }
+  input { width:100%; padding:10px; border-radius:8px; border:0; margin-top:6px; }
+</style>
+</head>
+<body>
+<h1>PulihNapas</h1>
+<p>Pemantau waktu pemulihan napas setelah aktivitas, memakai dua HP, MQTT, dan dashboard laptop.</p>
+<label>Kode ruang (harus sama di semua perangkat)
+  <input id="room" value="pn-kelD-x7q3">
+</label>
+<a id="l1" href="#">Buka di HP 1 (anggota 1)</a>
+<a id="l2" href="#">Buka di HP 2 (anggota 2)</a>
+<a id="ld" href="#">Buka Dashboard (laptop)</a>
+<p>Bukan alat medis. Lakukan aktivitas ringan saja dan berhenti jika pusing.</p>
+<script>
+const r = document.getElementById("room");
+function upd() {
+  const q = encodeURIComponent(r.value);
+  l1.href = `phone.html?id=hp1&room=${q}`;
+  l2.href = `phone.html?id=hp2&room=${q}`;
+  ld.href = `dashboard.html?room=${q}`;
+}
+r.addEventListener("input", upd); upd();
+</script>
+</body>
+</html>

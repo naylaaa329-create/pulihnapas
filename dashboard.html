@@ -1,0 +1,256 @@
+<!doctype html>
+<html lang="id">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>PulihNapas - Dashboard</title>
+<script src="https://unpkg.com/mqtt@5/dist/mqtt.min.js"></script>
+<script src="https://cdn.jsdelivr.net/npm/chart.js@4"></script>
+<style>
+  :root { --bg:#0f172a; --card:#1e293b; --tx:#e2e8f0; --mut:#94a3b8; --ok:#4ade80; --warn:#fbbf24; --bad:#f87171; --c1:#38bdf8; --c2:#f472b6; }
+  * { box-sizing:border-box; }
+  body { margin:0; font-family:system-ui,sans-serif; background:var(--bg); color:var(--tx); padding:20px; max-width:1100px; margin-inline:auto; }
+  h1 { margin:0 0 4px; font-size:24px; }
+  .sub { color:var(--mut); font-size:14px; margin-bottom:16px; }
+  .card { background:var(--card); border-radius:14px; padding:16px; margin-bottom:16px; }
+  .ctrl { display:flex; gap:10px; flex-wrap:wrap; align-items:center; }
+  button { padding:12px 18px; font-size:16px; font-weight:600; border:0; border-radius:10px; background:#334155; color:var(--tx); cursor:pointer; }
+  button:hover { background:#475569; }
+  button.active { background:var(--ok); color:#052e16; }
+  button.stop { background:#7f1d1d; } button.stop.active { background:var(--bad); color:#450a0a; }
+  .timer { font-size:28px; font-weight:700; margin-left:auto; font-variant-numeric:tabular-nums; }
+  .two { display:grid; grid-template-columns:1fr 1fr; gap:16px; }
+  @media (max-width:760px) { .two { grid-template-columns:1fr; } }
+  .hp h2 { margin:0 0 10px; font-size:18px; display:flex; align-items:center; gap:8px; }
+  .dot { width:10px; height:10px; border-radius:50%; background:var(--bad); display:inline-block; }
+  .dot.on { background:var(--ok); }
+  .hp1 h2 { color:var(--c1); } .hp2 h2 { color:var(--c2); }
+  table { width:100%; border-collapse:collapse; font-size:15px; }
+  td { padding:6px 0; border-bottom:1px solid #334155; } td:last-child { text-align:right; font-weight:600; }
+  .big { font-size:34px; font-weight:700; }
+  .muted { color:var(--mut); font-size:13px; }
+  .tools { display:flex; gap:10px; flex-wrap:wrap; align-items:center; font-size:14px; }
+  .tools button { padding:8px 14px; font-size:14px; }
+  canvas { max-height:340px; }
+</style>
+</head>
+<body>
+<h1>PulihNapas - Dashboard</h1>
+<div class="sub">Ruang: <b id="roomTxt"></b> &middot; MQTT: <b id="mqttTxt">menghubungkan...</b> &middot; Fase: <b id="phaseTxt">idle</b></div>
+
+<div class="card">
+  <div class="ctrl">
+    <button data-cmd="baseline">1. Baseline</button>
+    <button data-cmd="activity">2. Aktivitas</button>
+    <button data-cmd="recovery">3. Pemulihan</button>
+    <button data-cmd="stop" class="stop">Stop</button>
+    <div class="timer" id="timer">00:00</div>
+  </div>
+  <div class="muted" style="margin-top:10px">Baseline &asymp; 60 detik, aktivitas &asymp; 60 detik (lompat/squat), lalu pemulihan sampai muncul "waktu pulih". Pulih = napas &le; baseline &times; 1,15 pada 2 laporan berturut-turut.</div>
+</div>
+
+<div class="card"><canvas id="chart"></canvas></div>
+
+<div class="two">
+  <div class="card hp hp1"><h2><span class="dot" id="dot-hp1"></span>HP 1</h2><div class="big" id="bpm-hp1">-</div><div class="muted">napas/menit (terakhir)</div>
+    <table>
+      <tr><td>Status</td><td id="st-hp1">offline</td></tr>
+      <tr><td>Baseline</td><td id="base-hp1">-</td></tr>
+      <tr><td>Napas puncak</td><td id="peak-hp1">-</td></tr>
+      <tr><td>Repetisi</td><td id="reps-hp1">0</td></tr>
+      <tr><td>Waktu pulih</td><td id="rec-hp1">-</td></tr>
+      <tr><td>Latensi (RTT/2)</td><td id="lat-hp1">-</td></tr>
+    </table></div>
+  <div class="card hp hp2"><h2><span class="dot" id="dot-hp2"></span>HP 2</h2><div class="big" id="bpm-hp2">-</div><div class="muted">napas/menit (terakhir)</div>
+    <table>
+      <tr><td>Status</td><td id="st-hp2">offline</td></tr>
+      <tr><td>Baseline</td><td id="base-hp2">-</td></tr>
+      <tr><td>Napas puncak</td><td id="peak-hp2">-</td></tr>
+      <tr><td>Repetisi</td><td id="reps-hp2">0</td></tr>
+      <tr><td>Waktu pulih</td><td id="rec-hp2">-</td></tr>
+      <tr><td>Latensi (RTT/2)</td><td id="lat-hp2">-</td></tr>
+    </table></div>
+</div>
+
+<div class="card tools">
+  <label><input type="checkbox" id="simChk"> Mode simulasi (HP palsu, untuk uji dashboard tanpa HP)</label>
+  <button id="csvBtn">Unduh log CSV</button>
+  <button id="resetBtn">Reset data</button>
+  <span class="muted">Latensi satu arah (selisih jam, indikatif): <b id="oneway">-</b></span>
+</div>
+
+<script>
+/* ====== KONFIGURASI ====== */
+const params = new URLSearchParams(location.search);
+const ROOM = params.get("room") || "pn-kelD-x7q3";   // GANTI: samakan dengan phone.html
+const BROKERS = params.get("broker") ? [params.get("broker")] :
+  ["wss://broker.hivemq.com:8884/mqtt", "wss://broker.emqx.io:8084/mqtt"];
+const HPS = ["hp1", "hp2"];
+const RECOVER_FACTOR = 1.15, RECOVER_NEED = 2;
+const $ = id => document.getElementById(id);
+$("roomTxt").textContent = ROOM;
+
+/* ====== STATE ====== */
+const S = {};
+function freshHP() { return { last: 0, bpm: null, reps: 0, base: null, baseList: [], peak: null, ok: 0, recTime: null, rtt: [], oneway: [] }; }
+HPS.forEach(id => S[id] = freshHP());
+let phase = "idle", phaseStart = Date.now(), recStart = null, t0 = Date.now();
+const LOG = [["waktu_iso", "hp", "jenis", "fase", "bpm", "amp", "reps", "latensi_satu_arah_ms"]];
+
+/* ====== MQTT ====== */
+let client, connected = false, brokerIdx = 0;
+function connectMQTT() {
+  const url = BROKERS[brokerIdx % BROKERS.length];
+  $("mqttTxt").textContent = "menghubungkan...";
+  client = mqtt.connect(url, { clientId: `pn-dash-${Math.random().toString(16).slice(2, 8)}`, reconnectPeriod: 3000, connectTimeout: 6000 });
+  const failTimer = setTimeout(() => { if (!connected) { client.end(true); brokerIdx++; connectMQTT(); } }, 9000);
+  client.on("connect", () => {
+    clearTimeout(failTimer); connected = true; $("mqttTxt").textContent = "terhubung";
+    client.subscribe(`${ROOM}/dev/#`);
+  });
+  client.on("close", () => { connected = false; $("mqttTxt").textContent = "terputus"; });
+  client.on("message", onMessage);
+}
+function pubRaw(topic, obj) { if (client && connected) client.publish(topic, JSON.stringify(obj)); }
+
+/* ====== PERINTAH (dashboard -> HP) ====== */
+function sendCmd(cmd) {
+  const t = Date.now();
+  phase = cmd === "stop" ? "idle" : cmd;
+  phaseStart = t;
+  HPS.forEach(id => {
+    const s = S[id];
+    if (cmd === "baseline") { s.baseList = []; s.base = null; s.peak = null; s.ok = 0; s.recTime = null; }
+    if (cmd === "activity") { s.reps = 0; }
+    if (cmd === "recovery") { s.peak = null; s.ok = 0; s.recTime = null; recStart = t; }
+  });
+  pubRaw(`${ROOM}/cmd`, { cmd, t });
+  if ($("simChk").checked) HPS.forEach(id => setTimeout(() => pubRaw(`${ROOM}/dev/${id}/ack`, { cmd, t, from: id }), 30 + Math.random() * 90));
+  document.querySelectorAll("[data-cmd]").forEach(b => b.classList.toggle("active", b.dataset.cmd === cmd));
+  $("phaseTxt").textContent = phase;
+  render();
+}
+document.querySelectorAll("[data-cmd]").forEach(b => b.addEventListener("click", () => sendCmd(b.dataset.cmd)));
+
+/* ====== TERIMA DATA (HP -> dashboard) ====== */
+const median = a => { const s = [...a].sort((x, y) => x - y), m = s.length >> 1; return s.length % 2 ? s[m] : (s[m - 1] + s[m]) / 2; };
+
+function onMessage(topic, payload) {
+  const p = topic.split("/");              // [room, "dev", id, jenis]
+  if (p.length < 4 || p[1] !== "dev" || !S[p[2]]) return;
+  let m; try { m = JSON.parse(payload.toString()); } catch { return; }
+  const id = p[2], kind = p[3], s = S[id], now = Date.now();
+  s.last = now;
+  const oneway = m.t ? now - m.t : null;
+  if (kind === "ack") {
+    if (m.t) { s.rtt.push((now - m.t) / 2); }
+    LOG.push([new Date(now).toISOString(), id, "ack", m.cmd, "", "", "", ""]);
+  } else if (kind === "reps") {
+    s.reps = m.reps;
+    if (oneway !== null) s.oneway.push(oneway);
+    LOG.push([new Date(now).toISOString(), id, "reps", phase, "", "", m.reps, oneway ?? ""]);
+  } else if (kind === "resp") {
+    s.bpm = m.bpm;
+    if (oneway !== null) s.oneway.push(oneway);
+    LOG.push([new Date(now).toISOString(), id, "resp", m.phase, m.bpm ?? "", m.amp ?? "", "", oneway ?? ""]);
+    if (m.bpm != null) {
+      addPoint(id, (now - t0) / 1000, m.bpm);
+      if (m.phase === "baseline" && phase === "baseline") { s.baseList.push(m.bpm); s.base = median(s.baseList); }
+      if (m.phase === "recovery" && phase === "recovery") {
+        s.peak = s.peak == null ? m.bpm : Math.max(s.peak, m.bpm);
+        if (s.base && s.recTime === null) {
+          s.ok = m.bpm <= s.base * RECOVER_FACTOR ? s.ok + 1 : 0;
+          if (s.ok >= RECOVER_NEED) s.recTime = (now - recStart) / 1000;
+        }
+      }
+    }
+  }
+  render();
+}
+
+/* ====== GRAFIK ====== */
+const chart = new Chart($("chart"), {
+  type: "line",
+  data: { datasets: [
+    { label: "HP 1", data: [], borderColor: "#38bdf8", backgroundColor: "#38bdf8", tension: .25, pointRadius: 3 },
+    { label: "HP 2", data: [], borderColor: "#f472b6", backgroundColor: "#f472b6", tension: .25, pointRadius: 3 },
+  ]},
+  options: {
+    animation: false, parsing: false, responsive: true, spanGaps: true,
+    scales: {
+      x: { type: "linear", title: { display: true, text: "detik sejak dashboard dibuka", color: "#94a3b8" }, ticks: { color: "#94a3b8" }, grid: { color: "#334155" } },
+      y: { min: 0, title: { display: true, text: "napas per menit", color: "#94a3b8" }, ticks: { color: "#94a3b8" }, grid: { color: "#334155" } },
+    },
+    plugins: { legend: { labels: { color: "#e2e8f0" } } },
+  },
+});
+function addPoint(id, x, y) {
+  const ds = chart.data.datasets[HPS.indexOf(id)].data;
+  ds.push({ x, y }); if (ds.length > 600) ds.shift();
+  chart.update("none");
+}
+
+/* ====== TAMPILAN ====== */
+const f1 = v => v == null ? "-" : v.toFixed(1);
+function render() {
+  const now = Date.now();
+  HPS.forEach(id => {
+    const s = S[id], on = now - s.last < 15000;
+    $("dot-" + id).classList.toggle("on", on);
+    $("st-" + id).textContent = on ? "online" : "offline";
+    $("bpm-" + id).textContent = f1(s.bpm);
+    $("base-" + id).textContent = s.base ? f1(s.base) + " bpm" : "-";
+    $("peak-" + id).textContent = s.peak ? f1(s.peak) + " bpm" : "-";
+    $("reps-" + id).textContent = s.reps;
+    $("rec-" + id).textContent = s.recTime != null ? s.recTime.toFixed(0) + " detik"
+      : (phase === "recovery" ? (s.base ? "mengukur..." : "baseline belum ada") : "-");
+    $("lat-" + id).textContent = s.rtt.length ? (s.rtt.reduce((a, b) => a + b, 0) / s.rtt.length).toFixed(0) + " ms (n=" + s.rtt.length + ")" : "-";
+  });
+  const all = HPS.flatMap(id => S[id].oneway);
+  $("oneway").textContent = all.length ? (all.reduce((a, b) => a + b, 0) / all.length).toFixed(0) + " ms" : "-";
+}
+setInterval(() => {
+  const sec = Math.floor((Date.now() - phaseStart) / 1000);
+  $("timer").textContent = String(Math.floor(sec / 60)).padStart(2, "0") + ":" + String(sec % 60).padStart(2, "0");
+  render();
+}, 500);
+
+/* ====== LOG & RESET ====== */
+$("csvBtn").onclick = () => {
+  const csv = LOG.map(r => r.join(",")).join("\n");
+  const a = document.createElement("a");
+  a.href = URL.createObjectURL(new Blob([csv], { type: "text/csv" }));
+  a.download = "pulihnapas-log.csv"; a.click();
+};
+$("resetBtn").onclick = () => {
+  HPS.forEach(id => S[id] = freshHP());
+  chart.data.datasets.forEach(d => d.data = []); chart.update();
+  LOG.length = 1; phase = "idle"; phaseStart = Date.now(); t0 = Date.now();
+  document.querySelectorAll("[data-cmd]").forEach(b => b.classList.remove("active"));
+  $("phaseTxt").textContent = "idle"; render();
+};
+
+/* ====== SIMULATOR (HP palsu, lewat MQTT yang sama) ====== */
+const SIM = { hp1: { base: 14, peak: 30, reps: 0 }, hp2: { base: 17, peak: 34, reps: 0 } };
+let simTick = 0;
+setInterval(() => {
+  if (!$("simChk").checked || !connected) return;
+  simTick++;
+  HPS.forEach(id => {
+    const c = SIM[id], t = Date.now(), noise = (Math.random() - .5) * 1.6;
+    if (phase === "activity") { c.reps += Math.random() < .8 ? 1 : 2; pubRaw(`${ROOM}/dev/${id}/reps`, { reps: c.reps, t }); }
+    if (phase === "baseline" || phase === "activity") { if (phase === "baseline") c.reps = 0; }
+    if (simTick % 5 === 0) {
+      let bpm = null;
+      if (phase === "baseline") bpm = c.base + noise;
+      if (phase === "recovery") bpm = c.base + (c.peak - c.base) * Math.exp(-((t - recStart) / 1000) / 40) + noise * .7;
+      pubRaw(`${ROOM}/dev/${id}/resp`, { bpm: bpm == null ? null : +bpm.toFixed(1), amp: .05, phase, t });
+    }
+  });
+}, 1000);
+
+connectMQTT();
+render();
+</script>
+</body>
+</html>
