@@ -25,9 +25,9 @@ Sistem IoT untuk mengukur dan memprediksi **waktu pulih napas** setelah aktivita
 
 ## Alur kerja
 
-1. **Baseline:** rebahan, HP di perut, diam. Napas normal dicatat.
+1. **Baseline:** duduk santai, HP di perut, diam. Napas normal dicatat.
 2. **Aktivitas:** HP di saku atau dipegang, lompat atau squat. Repetisi dihitung.
-3. **Pemulihan:** rebahan lagi. Dashboard memantau napas, memprediksi kapan pulih, lalu mencatat waktu pulih sebenarnya.
+3. **Pemulihan:** duduk santai lagi. Dashboard memantau napas, memprediksi kapan pulih, lalu mencatat waktu pulih sebenarnya.
 
 Pulih = napas ≤ baseline × 1,15 sebanyak 2 laporan berturut-turut.
 
