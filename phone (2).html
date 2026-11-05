@@ -1,0 +1,230 @@
+<!DOCTYPE html>
+<html lang="id">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>PulihNapas - HP</title>
+  <script src="https://unpkg.com/mqtt@5/dist/mqtt.min.js"></script>
+  <style>
+    body { font-family: Arial, sans-serif; max-width: 420px; margin: 20px auto; padding: 0 12px; }
+    .kotak { border: 1px solid #ccc; border-radius: 8px; padding: 12px; margin-bottom: 12px; text-align: center; }
+    .angka { font-size: 32px; font-weight: bold; }
+    button { width: 100%; padding: 14px; font-size: 18px; }
+  </style>
+</head>
+<body>
+  <h2>PulihNapas - HP</h2>
+  <p>Perangkat: <b id="nama"></b> | MQTT: <b id="status">menghubungkan...</b></p>
+
+  <div class="kotak">
+    <div>Fase: <b id="fase">idle</b></div>
+    <p id="petunjuk"></p>
+  </div>
+
+  <div class="kotak">
+    <div>Napas per menit</div>
+    <div class="angka" id="bpm">-</div>
+  </div>
+
+  <div class="kotak">
+    <div>Repetisi</div>
+    <div class="angka" id="reps">0</div>
+  </div>
+
+  <button onclick="mulaiSensor()">Mulai sensor</button>
+  <p id="pesan"></p>
+
+<script>
+// ===== Pengaturan =====
+const ROOM = "pn-kelD-x7q3";      // kode ruang, harus sama dengan dashboard.html
+const ID = new URLSearchParams(location.search).get("id") || "hp1";   // hp1 atau hp2
+const AMBANG_REP = 3;             // m/s2, gerakan di atas ini dihitung 1 repetisi (disetel saat uji)
+const JEDA_REP = 500;             // milidetik, jeda minimal antar repetisi (disetel saat uji)
+const AMBANG_NAPAS = 0.5;         // puncak napas harus > 0,5 x simpangan baku sinyal
+
+document.getElementById("nama").textContent = ID;
+
+// ===== MQTT =====
+const client = mqtt.connect("wss://broker.hivemq.com:8884/mqtt");
+
+client.on("connect", function () {
+  document.getElementById("status").textContent = "terhubung";
+  client.subscribe(ROOM + "/cmd");           // dengarkan perintah dari dashboard
+});
+
+client.on("message", function (topic, pesan) {
+  const data = JSON.parse(pesan.toString());
+  ubahFase(data.cmd);
+  kirim("ack", { cmd: data.cmd, t: data.t }); // balas, dipakai dashboard untuk hitung latensi
+});
+
+function kirim(jenis, isi) {
+  client.publish(ROOM + "/dev/" + ID + "/" + jenis, JSON.stringify(isi));
+}
+
+// ===== Fase =====
+let fase = "idle";
+const petunjuk = {
+  idle: "Menunggu perintah dari dashboard.",
+  baseline: "Rebahan telentang, HP di perut, diam.",
+  activity: "Pegang HP atau taruh di saku, lalu lompat atau squat.",
+  recovery: "Rebahan telentang lagi, HP di perut, diam."
+};
+
+function ubahFase(cmd) {
+  if (cmd === "stop") cmd = "idle";
+  if (!petunjuk[cmd]) return;          // perintah tidak dikenal
+  fase = cmd;
+  dataAkselerometer = [];              // mulai rekam data baru
+  dataGiro = [[], [], []];
+  sudut = [0, 0, 0];
+  if (cmd === "activity") repetisi = 0;
+  tampilkan();
+}
+
+function tampilkan() {
+  document.getElementById("fase").textContent = fase;
+  document.getElementById("petunjuk").textContent = petunjuk[fase];
+  document.getElementById("reps").textContent = repetisi;
+}
+
+// ===== Sensor =====
+let ax = 0, ay = 0, az = 0;            // percepatan terakhir (akselerometer)
+let gx = 0, gy = 0, gz = 0;            // kecepatan putar terakhir (giroskop), derajat/detik
+let sudut = [0, 0, 0];                 // sudut hasil penjumlahan kecepatan putar
+let dataAkselerometer = [];            // 1 data tiap 0,1 detik, simpan 30 detik terakhir
+let dataGiro = [[], [], []];           // sudut per sumbu, sama seperti di atas
+let repetisi = 0;
+let waktuRepTerakhir = 0;
+
+async function mulaiSensor() {
+  // iPhone harus minta izin dulu
+  if (typeof DeviceMotionEvent.requestPermission === "function") {
+    await DeviceMotionEvent.requestPermission();
+  }
+  // supaya layar tidak mati (kalau layar mati, sensor berhenti)
+  try { await navigator.wakeLock.request("screen"); } catch (e) {}
+
+  window.addEventListener("devicemotion", bacaSensor);
+  setInterval(catatSampel, 100);       // catat data tiap 0,1 detik
+  setInterval(laporkanNapas, 5000);    // kirim napas per menit tiap 5 detik
+  setInterval(laporkanRepetisi, 1000); // kirim repetisi tiap 1 detik
+  document.getElementById("pesan").textContent = "Sensor aktif.";
+}
+
+function bacaSensor(e) {
+  const a = e.accelerationIncludingGravity;
+  const g = e.rotationRate;
+  if (!a) return;
+  ax = a.x; ay = a.y; az = a.z;
+  if (g) { gx = g.alpha; gy = g.beta; gz = g.gamma; }
+
+  if (fase === "activity") hitungRepetisi();
+}
+
+// ===== Pemrosesan 1: hitung repetisi =====
+function hitungRepetisi() {
+  const total = Math.sqrt(ax * ax + ay * ay + az * az);   // besar percepatan
+  const gerak = Math.abs(total - 9.8);                    // selisih dari gravitasi (HP diam = 9,8)
+  const sekarang = Date.now();
+  if (gerak > AMBANG_REP && sekarang - waktuRepTerakhir > JEDA_REP) {
+    repetisi++;
+    waktuRepTerakhir = sekarang;
+  }
+  document.getElementById("reps").textContent = repetisi;
+}
+
+function laporkanRepetisi() {
+  if (fase === "activity") kirim("reps", { reps: repetisi, t: Date.now() });
+}
+
+// ===== Pemrosesan 2: napas per menit =====
+function catatSampel() {
+  if (fase !== "baseline" && fase !== "recovery") return;
+
+  dataAkselerometer.push(Math.sqrt(ax * ax + ay * ay + az * az));
+
+  sudut[0] += gx * 0.1;                // sudut = jumlah (kecepatan putar x 0,1 detik)
+  sudut[1] += gy * 0.1;
+  sudut[2] += gz * 0.1;
+  for (let k = 0; k < 3; k++) dataGiro[k].push(sudut[k]);
+
+  if (dataAkselerometer.length > 300) {   // simpan 30 detik terakhir saja
+    dataAkselerometer.shift();
+    for (let k = 0; k < 3; k++) dataGiro[k].shift();
+  }
+}
+
+// rata-rata bergerak: tiap titik diganti rata-rata dengan tetangganya
+function rataRataBergerak(data, setengahJendela) {
+  return data.map(function (_, i) {
+    let jumlah = 0, banyak = 0;
+    for (let j = i - setengahJendela; j <= i + setengahJendela; j++) {
+      if (j >= 0 && j < data.length) { jumlah += data[j]; banyak++; }
+    }
+    return jumlah / banyak;
+  });
+}
+
+// hitung napas per menit dari satu sinyal (data masuk 10 titik per detik)
+function hitungNapas(data) {
+  // 1. buang gerakan pelan (tren) dengan mengurangi rata-rata bergerak 6 detik
+  const tren = rataRataBergerak(data, 30);
+  const sinyal = data.map(function (v, i) { return v - tren[i]; });
+
+  // 2. haluskan sinyal
+  const halus = rataRataBergerak(sinyal, 2);
+
+  // 3. simpangan baku = seberapa besar naik-turunnya sinyal
+  let jumlahKuadrat = 0;
+  for (const v of halus) jumlahKuadrat += v * v;
+  const sd = Math.sqrt(jumlahKuadrat / halus.length);
+
+  // 4. cari puncak (satu puncak = satu tarikan napas)
+  const puncak = [];
+  for (let i = 1; i < halus.length - 1; i++) {
+    const lebihTinggiDariTetangga = halus[i] > halus[i - 1] && halus[i] >= halus[i + 1];
+    const cukupBesar = halus[i] > AMBANG_NAPAS * sd;
+    const jauhDariPuncakLalu = puncak.length === 0 || i - puncak[puncak.length - 1] > 12; // > 1,2 detik
+    if (lebihTinggiDariTetangga && cukupBesar && jauhDariPuncakLalu) puncak.push(i);
+  }
+  if (puncak.length < 3) return { bpm: null, sd: sd };   // puncak kurang, tidak bisa dihitung
+
+  // 5. napas per menit = jumlah jeda antar puncak / lama (detik) x 60
+  const lamaDetik = (puncak[puncak.length - 1] - puncak[0]) / 10;
+  return { bpm: 60 * (puncak.length - 1) / lamaDetik, sd: sd };
+}
+
+function laporkanNapas() {
+  if (fase !== "baseline" && fase !== "recovery") return;
+
+  if (dataAkselerometer.length < 150) {   // butuh minimal 15 detik data
+    kirim("resp", { bpm: null, phase: fase, t: Date.now() });
+    return;
+  }
+
+  // sensor 1: akselerometer
+  const a = hitungNapas(dataAkselerometer);
+
+  // sensor 2: giroskop, pakai sumbu yang naik-turunnya paling besar
+  let g = hitungNapas(dataGiro[0]);
+  for (let k = 1; k < 3; k++) {
+    const hasil = hitungNapas(dataGiro[k]);
+    if (hasil.sd > g.sd) g = hasil;
+  }
+
+  // gabungkan dua sensor: kalau selisih <= 3, ambil rata-rata; kalau tidak, percaya akselerometer
+  let bpm = (a.bpm !== null) ? a.bpm : g.bpm;
+  if (a.bpm !== null && g.bpm !== null && Math.abs(a.bpm - g.bpm) <= 3) {
+    bpm = (a.bpm + g.bpm) / 2;
+  }
+
+  if (bpm !== null) bpm = Math.round(bpm * 10) / 10;
+  document.getElementById("bpm").textContent = (bpm !== null) ? bpm : "-";
+  kirim("resp", { bpm: bpm, phase: fase, t: Date.now() });
+}
+
+tampilkan();
+</script>
+</body>
+</html>

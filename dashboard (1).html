@@ -1,0 +1,267 @@
+<!DOCTYPE html>
+<html lang="id">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>PulihNapas - Dashboard</title>
+  <script src="https://unpkg.com/mqtt@5/dist/mqtt.min.js"></script>
+  <script src="https://cdn.jsdelivr.net/npm/chart.js@4"></script>
+  <style>
+    body { font-family: Arial, sans-serif; max-width: 900px; margin: 20px auto; padding: 0 12px; }
+    .kotak { border: 1px solid #ccc; border-radius: 8px; padding: 12px; margin-bottom: 12px; }
+    .dua { display: flex; gap: 12px; flex-wrap: wrap; }
+    .dua .kotak { flex: 1; min-width: 280px; }
+    button { padding: 10px 16px; font-size: 16px; margin-right: 6px; }
+    td { padding: 3px 12px 3px 0; }
+  </style>
+</head>
+<body>
+  <h2>PulihNapas - Dashboard</h2>
+  <p>MQTT: <b id="status">menghubungkan...</b> | Fase: <b id="fase">idle</b></p>
+
+  <div class="kotak">
+    <button onclick="kirimPerintah('baseline')">1. Baseline</button>
+    <button onclick="kirimPerintah('activity')">2. Aktivitas</button>
+    <button onclick="kirimPerintah('recovery')">3. Pemulihan</button>
+    <button onclick="kirimPerintah('stop')">Stop</button>
+    <p>Pulih = napas &le; baseline &times; 1,15 dua kali berturut-turut.
+       Garis putus-putus di grafik = prediksi AI.</p>
+  </div>
+
+  <div class="kotak"><canvas id="grafik"></canvas></div>
+
+  <div class="dua">
+    <div class="kotak">
+      <h3>HP 1</h3>
+      <table>
+        <tr><td>Napas sekarang</td><td id="hp1-bpm">-</td></tr>
+        <tr><td>Baseline</td><td id="hp1-baseline">-</td></tr>
+        <tr><td>Napas puncak</td><td id="hp1-puncak">-</td></tr>
+        <tr><td>Repetisi</td><td id="hp1-reps">0</td></tr>
+        <tr><td>Prediksi pulih (AI)</td><td id="hp1-prediksi">-</td></tr>
+        <tr><td>Waktu pulih</td><td id="hp1-pulih">-</td></tr>
+        <tr><td>Galat prediksi</td><td id="hp1-galat">-</td></tr>
+        <tr><td>Latensi</td><td id="hp1-latensi">-</td></tr>
+      </table>
+    </div>
+    <div class="kotak">
+      <h3>HP 2</h3>
+      <table>
+        <tr><td>Napas sekarang</td><td id="hp2-bpm">-</td></tr>
+        <tr><td>Baseline</td><td id="hp2-baseline">-</td></tr>
+        <tr><td>Napas puncak</td><td id="hp2-puncak">-</td></tr>
+        <tr><td>Repetisi</td><td id="hp2-reps">0</td></tr>
+        <tr><td>Prediksi pulih (AI)</td><td id="hp2-prediksi">-</td></tr>
+        <tr><td>Waktu pulih</td><td id="hp2-pulih">-</td></tr>
+        <tr><td>Galat prediksi</td><td id="hp2-galat">-</td></tr>
+        <tr><td>Latensi</td><td id="hp2-latensi">-</td></tr>
+      </table>
+    </div>
+  </div>
+
+<script>
+// ===== Pengaturan =====
+const ROOM = "pn-kelD-x7q3";     // kode ruang, harus sama dengan phone.html
+const FAKTOR_PULIH = 1.15;       // pulih kalau napas <= baseline x 1,15
+const WAKTU_PREDIKSI_AWAL = 30;  // detik, prediksi pada waktu ini dicatat untuk dihitung galatnya
+
+// ===== Data tiap HP =====
+function buatData() {
+  return {
+    bpm: null, baseline: null, daftarBaseline: [], puncak: null, repetisi: 0,
+    titikPemulihan: [],   // daftar {t: detik sejak pemulihan, bpm: napas}
+    berturut: 0, waktuPulih: null,
+    prediksi: null, prediksiAwal: null, galat: null,
+    latensi: []
+  };
+}
+const data = { hp1: buatData(), hp2: buatData() };
+let fase = "idle";
+let waktuMulaiPemulihan = 0;
+const waktuBuka = Date.now();
+
+// ===== MQTT =====
+const client = mqtt.connect("wss://broker.hivemq.com:8884/mqtt");
+
+client.on("connect", function () {
+  document.getElementById("status").textContent = "terhubung";
+  client.subscribe(ROOM + "/dev/#");         // dengarkan semua data dari HP
+});
+
+client.on("message", function (topic, pesan) {
+  const bagian = topic.split("/");            // contoh: [ROOM, "dev", "hp1", "resp"]
+  const id = bagian[2];
+  const jenis = bagian[3];
+  if (!data[id]) return;
+  const isi = JSON.parse(pesan.toString());
+
+  if (jenis === "ack") data[id].latensi.push((Date.now() - isi.t) / 2);   // waktu pulang-pergi dibagi 2
+  if (jenis === "reps") data[id].repetisi = isi.reps;
+  if (jenis === "resp") prosesNapas(id, isi);
+  tampilkan();
+});
+
+// ===== Kirim perintah ke HP =====
+function kirimPerintah(cmd) {
+  fase = (cmd === "stop") ? "idle" : cmd;
+  if (cmd === "recovery") waktuMulaiPemulihan = Date.now();
+
+  for (const id of ["hp1", "hp2"]) {
+    const d = data[id];
+    if (cmd === "baseline") { d.daftarBaseline = []; d.baseline = null; }
+    if (cmd === "activity") d.repetisi = 0;
+    if (cmd === "baseline" || cmd === "recovery") {
+      d.titikPemulihan = []; d.puncak = null; d.berturut = 0; d.waktuPulih = null;
+      d.prediksi = null; d.prediksiAwal = null; d.galat = null;
+      gambarPrediksi(id);
+    }
+  }
+  client.publish(ROOM + "/cmd", JSON.stringify({ cmd: cmd, t: Date.now() }));
+  tampilkan();
+}
+
+// ===== Pemrosesan 3: baseline dan waktu pulih =====
+function median(daftar) {
+  const urut = daftar.slice().sort(function (a, b) { return a - b; });
+  return urut[Math.floor(urut.length / 2)];
+}
+
+function prosesNapas(id, isi) {
+  const d = data[id];
+  d.bpm = isi.bpm;
+  if (isi.bpm === null || isi.phase !== fase) return;   // abaikan data kosong atau data fase lama
+
+  // tambah titik ke grafik
+  const nomor = (id === "hp1") ? 0 : 1;
+  grafik.data.datasets[nomor].data.push({ x: (Date.now() - waktuBuka) / 1000, y: isi.bpm });
+  grafik.update();
+
+  if (fase === "baseline") {
+    d.daftarBaseline.push(isi.bpm);
+    d.baseline = median(d.daftarBaseline);            // baseline = nilai tengah napas saat baseline
+  }
+
+  if (fase === "recovery") {
+    const detik = (Date.now() - waktuMulaiPemulihan) / 1000;
+    d.titikPemulihan.push({ t: detik, bpm: isi.bpm });
+    if (d.puncak === null || isi.bpm > d.puncak) d.puncak = isi.bpm;
+    cekPulih(d, detik);
+    prediksiPulih(id, d);
+  }
+}
+
+function cekPulih(d, detik) {
+  if (d.waktuPulih !== null || d.baseline === null) return;
+  if (d.bpm <= d.baseline * FAKTOR_PULIH) d.berturut++;
+  else d.berturut = 0;
+
+  if (d.berturut >= 2) {                      // 2 laporan berturut-turut di bawah batas
+    d.waktuPulih = detik;
+    if (d.prediksiAwal !== null) d.galat = d.prediksiAwal - detik;   // galat = prediksi - aktual
+  }
+}
+
+// ===== Pemrosesan 4 (AI): prediksi waktu pulih dengan regresi linear =====
+// Napas yang pulih turun seperti kurva: napas = baseline + A * e^(-t/tau)
+// Kalau kita ambil ln(napas - baseline), kurvanya jadi garis lurus: y = c + m*t
+// Garis lurus itu dicari dengan regresi linear, lalu diperpanjang sampai menyentuh batas pulih.
+function prediksiPulih(id, d) {
+  if (d.waktuPulih !== null || d.baseline === null) return;   // sudah pulih atau belum ada baseline
+
+  // ln hanya bisa untuk angka positif, jadi ambil titik yang napasnya masih di atas baseline
+  const titik = d.titikPemulihan.filter(function (p) { return p.bpm - d.baseline > 0.5; });
+  if (titik.length < 4) return;
+  const tTerakhir = titik[titik.length - 1].t;
+  if (tTerakhir - titik[0].t < 15) return;                    // butuh data minimal 15 detik
+
+  // regresi linear: cari m (kemiringan) dan c (titik potong)
+  let n = titik.length, sumX = 0, sumY = 0, sumXX = 0, sumXY = 0;
+  for (const p of titik) {
+    const y = Math.log(p.bpm - d.baseline);
+    sumX += p.t; sumY += y; sumXX += p.t * p.t; sumXY += p.t * y;
+  }
+  const m = (n * sumXY - sumX * sumY) / (n * sumXX - sumX * sumX);
+  const c = (sumY - m * sumX) / n;
+  if (m >= 0) return;                                         // napas tidak turun, belum bisa diprediksi
+
+  // waktu saat garis menyentuh batas pulih: ln(batas) = c + m*t
+  const batas = d.baseline * (FAKTOR_PULIH - 1);
+  const tPulih = Math.max(0, (Math.log(batas) - c) / m);
+
+  d.prediksi = { m: m, c: c, tPulih: tPulih, sisa: Math.max(0, tPulih - tTerakhir) };
+  if (d.prediksiAwal === null && tTerakhir >= WAKTU_PREDIKSI_AWAL) d.prediksiAwal = tPulih;
+  gambarPrediksi(id);
+}
+
+// ===== Grafik =====
+const grafik = new Chart(document.getElementById("grafik"), {
+  type: "line",
+  data: {
+    datasets: [
+      { label: "HP 1", data: [], borderColor: "blue" },
+      { label: "HP 2", data: [], borderColor: "red" },
+      { label: "HP 1 prediksi", data: [], borderColor: "blue", borderDash: [6, 4], pointRadius: 0 },
+      { label: "HP 2 prediksi", data: [], borderColor: "red", borderDash: [6, 4], pointRadius: 0 }
+    ]
+  },
+  options: {
+    animation: false,
+    parsing: false,
+    scales: {
+      x: { type: "linear", title: { display: true, text: "detik sejak dashboard dibuka" } },
+      y: { title: { display: true, text: "napas per menit" } }
+    }
+  }
+});
+
+// gambar garis prediksi: napas(t) = baseline + e^(c + m*t)
+function gambarPrediksi(id) {
+  const d = data[id];
+  const garis = grafik.data.datasets[(id === "hp1") ? 2 : 3];
+  garis.data = [];
+  if (d.prediksi !== null) {
+    const awal = (waktuMulaiPemulihan - waktuBuka) / 1000;
+    for (let t = 0; t <= d.prediksi.tPulih + 15; t += 5) {
+      garis.data.push({ x: awal + t, y: d.baseline + Math.exp(d.prediksi.c + d.prediksi.m * t) });
+    }
+  }
+  grafik.update();
+}
+
+// ===== Tampilan =====
+function teks(id, nilai) {
+  document.getElementById(id).textContent = nilai;
+}
+
+function tampilkan() {
+  teks("fase", fase);
+  for (const id of ["hp1", "hp2"]) {
+    const d = data[id];
+    teks(id + "-bpm", d.bpm !== null ? d.bpm : "-");
+    teks(id + "-baseline", d.baseline !== null ? d.baseline.toFixed(1) : "-");
+    teks(id + "-puncak", d.puncak !== null ? d.puncak.toFixed(1) : "-");
+    teks(id + "-reps", d.repetisi);
+
+    let prediksi = "-";
+    if (d.waktuPulih !== null) prediksi = "selesai";
+    else if (d.prediksi !== null) prediksi = "sekitar " + Math.round(d.prediksi.sisa) + " detik lagi";
+    else if (fase === "recovery") prediksi = "mengumpulkan data...";
+    teks(id + "-prediksi", prediksi);
+
+    teks(id + "-pulih", d.waktuPulih !== null ? Math.round(d.waktuPulih) + " detik" : "-");
+    teks(id + "-galat", d.galat !== null ? Math.round(d.galat) + " detik" : "-");
+
+    let latensi = "-";
+    if (d.latensi.length > 0) {
+      let jumlah = 0;
+      for (const x of d.latensi) jumlah += x;
+      latensi = Math.round(jumlah / d.latensi.length) + " ms";
+    }
+    teks(id + "-latensi", latensi);
+  }
+}
+
+tampilkan();
+</script>
+</body>
+</html>
